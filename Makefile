@@ -16,3 +16,7 @@ broadcast:
 broadcast-efficient:
 	cargo build --bin broadcast
 	./maelstrom-binary/maelstrom test -w broadcast --bin ./target/debug/broadcast --log-stderr --node-count 25 --time-limit 20 --rate 100 --latency 100
+
+g-counter:
+	cargo build --bin g-counter
+	./maelstrom-binary/maelstrom test -w g-counter --bin ./target/debug/g-counter --log-stderr --node-count 3 --rate 100 --time-limit 20 --nemesis partition
