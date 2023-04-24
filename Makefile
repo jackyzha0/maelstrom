@@ -11,5 +11,5 @@ id:
 
 broadcast:
 	cargo build --bin broadcast
-	./maelstrom-binary/maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 5 --time-limit 20 --rate 10
+	./maelstrom-binary/maelstrom test -w broadcast --bin ./target/debug/broadcast --log-stderr --node-count 5 --time-limit 20 --rate 10 --nemesis partition
 

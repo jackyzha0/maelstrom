@@ -1,5 +1,5 @@
 use maelstrom::{
-    actor::Actor,
+    actor::{Actor, ActorID},
     errors::Error,
     message::{Message, MessageID},
     runtime::Runtime,
@@ -13,58 +13,60 @@ fn main() {
     runtime.start();
 }
 
+type UniqueMessageID = (ActorID, MessageID);
+
 #[derive(Default)]
 struct BroadcastActor {
-    node_id: Option<String>,
-    peers: Vec<String>,
-    messages: Vec<serde_json::value::Value>,
-    // map from message id -> set of acks (node id)
-    // TODO: remove acks when all nodes have acked
-    acks: HashMap<u64, HashSet<String>>,
+    node_id: Option<ActorID>,
+    peers: Vec<ActorID>,
+    messages: Vec<(UniqueMessageID, serde_json::value::Value)>,
+    known: HashMap<ActorID, HashSet<UniqueMessageID>>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
 enum Payload {
     Topology {
-        #[serde(rename = "type")]
-        message_type: String,
         msg_id: MessageID,
-        topology: HashMap<String, Vec<String>>,
+        topology: HashMap<ActorID, Vec<ActorID>>,
     },
-    TopologyAck {
-        #[serde(rename = "type")]
-        message_type: String,
+    TopologyOk {
         in_reply_to: MessageID,
     },
     Broadcast {
-        #[serde(rename = "type")]
-        message_type: String,
         msg_id: MessageID,
         message: Value,
     },
-    BroadcastAck {
-        #[serde(rename = "type")]
-        message_type: String,
+    BroadcastOk {
         in_reply_to: MessageID,
     },
+    Gossip {
+        payload: Vec<(UniqueMessageID, Value)>,
+    },
+    GossipOk {
+        seen: HashSet<UniqueMessageID>,
+    },
     Read {
-        #[serde(rename = "type")]
-        message_type: String,
         msg_id: MessageID,
     },
-    ReadAck {
-        #[serde(rename = "type")]
-        message_type: String,
+    ReadOk {
         messages: Vec<Value>,
         in_reply_to: MessageID,
     },
 }
 
+impl BroadcastActor {
+    #[inline(always)]
+    pub fn node_id(&self) -> String {
+        self.node_id.as_ref().unwrap().to_owned()
+    }
+}
+
 impl Actor for BroadcastActor {
     type MessagePayload = Payload;
 
-    fn init(&mut self, node_id: String, _node_ids: Vec<String>) -> Result<(), Error> {
+    fn init(&mut self, node_id: ActorID, _node_ids: Vec<ActorID>) -> Result<(), Error> {
         eprintln!("Initialized node {}", node_id);
         self.node_id = Some(node_id);
         Ok(())
@@ -75,88 +77,89 @@ impl Actor for BroadcastActor {
         message: &Message<Self::MessagePayload>,
     ) -> Result<Vec<Message<Self::MessagePayload>>, Error> {
         match &message.body {
-            Payload::Topology {
-                message_type,
-                msg_id,
-                topology,
-            } if message_type == "topology" => {
-                let peers = topology.get(self.node_id.as_ref().unwrap()).unwrap();
+            Payload::Topology { msg_id, topology } => {
+                let peers = topology.get(&self.node_id()).unwrap();
                 self.peers = peers.to_owned();
-                let ack = Payload::TopologyAck {
-                    message_type: "topology_ok".to_owned(),
+                let ack = Payload::TopologyOk {
                     in_reply_to: *msg_id,
                 };
                 Ok(vec![Message::new_reply_to(message, ack)])
             }
-            Payload::TopologyAck {
-                message_type,
-                in_reply_to: _,
-            } if message_type == "topology_ok" => Ok(vec![]),
             Payload::Broadcast {
-                message_type,
                 msg_id,
                 message: payload,
-            } if message_type == "broadcast" => {
-                // setup acks if it doesnt exist and add sender to set of acks
-                let acks = self.acks.entry(*msg_id).or_default();
-                acks.insert(message.src.to_owned());
-
-                let node_id = self.node_id.as_ref().unwrap();
-                if !acks.contains(node_id) {
-                    // only unwrap and add if we haven't seen it before
-                    self.messages.push(payload.to_owned());
-                    // set ourselves as acked
-                    acks.insert(node_id.clone());
-                }
-
-                // ack broadcast
-                let ack = Payload::BroadcastAck {
-                    message_type: "broadcast_ok".to_string(),
-                    in_reply_to: *msg_id,
-                };
-                let response = Message::new_reply_to(message, ack);
-                let mut responses: Vec<Message<Payload>> = vec![response];
-
-                // send to everyone that hasn't acked
-                responses.extend(self.peers.iter().filter(|peer| !acks.contains(*peer)).map(
-                    |peer| Message {
-                        src: self.node_id.as_ref().unwrap().to_owned(),
-                        dest: peer.to_string(),
-                        body: Payload::Broadcast {
-                            message_type: "broadcast".to_string(),
-                            msg_id: *msg_id,
-                            message: payload.clone(),
-                        },
+            } => {
+                let unique_id: UniqueMessageID = (message.src.to_string(), *msg_id);
+                let mut messages = self.receive(&Message {
+                    src: self.node_id(),
+                    dest: self.node_id(),
+                    body: Payload::Gossip {
+                        payload: vec![(unique_id, payload.to_owned())],
+                    },
+                })?;
+                messages.push(Message::new_reply_to(
+                    message,
+                    Payload::BroadcastOk {
+                        in_reply_to: *msg_id,
                     },
                 ));
+                Ok(messages)
+            }
+            Payload::Gossip { payload } => {
+                let our_id = self.node_id();
+                let our_known = self.known.entry(our_id.to_owned()).or_default();
+                for (msg_id, value) in payload {
+                    if !our_known.contains(msg_id) {
+                        self.messages.push((msg_id.to_owned(), value.to_owned()));
+                        our_known.insert(msg_id.to_owned());
+                    }
+                }
+
+                // ack
+                let mut responses: Vec<Message<Self::MessagePayload>> =
+                    vec![Message::new_reply_to(
+                        message,
+                        Payload::GossipOk { seen: our_known.to_owned() },
+                    )];
+
+                // construct gossip messages
+                responses.extend(self.peers.iter().filter_map(|peer| {
+                    let known = self.known.entry(peer.to_owned()).or_default();
+                    let msgs_to_send: Vec<(UniqueMessageID, Value)> = self
+                        .messages
+                        .iter()
+                        .cloned()
+                        .filter(|(msg_id, _)| !known.contains(msg_id))
+                        .collect();
+                    if msgs_to_send.is_empty() {
+                        None
+                    } else {
+                        Some(Message {
+                            src: our_id.clone(),
+                            dest: peer.to_owned(),
+                            body: Payload::Gossip {
+                                payload: msgs_to_send,
+                            },
+                        })
+                    }
+                }));
                 Ok(responses)
             }
-            Payload::BroadcastAck {
-                message_type,
-                in_reply_to,
-            } if message_type == "broadcast_ok" => {
-                // setup acks if it doesnt exist and add receiver to set of acks
-                let acks = self.acks.entry(*in_reply_to).or_default();
-                acks.insert(message.src.to_string());
+            Payload::GossipOk { seen } => {
+                let their_known = self.known.entry(message.src.to_owned()).or_default();
+                their_known.extend(seen.iter().cloned());
                 Ok(vec![])
             }
-            Payload::Read {
-                message_type,
-                msg_id,
-            } if message_type == "read" => {
-                let ack = Payload::ReadAck {
-                    message_type: "read_ok".to_string(),
-                    messages: self.messages.clone(),
+            Payload::Read { msg_id } => {
+                let ack = Payload::ReadOk {
+                    messages: self.messages.iter().map(|m| m.1.to_owned()).collect(),
                     in_reply_to: *msg_id,
                 };
                 Ok(vec![Message::new_reply_to(message, ack)])
             }
-            Payload::ReadAck {
-                message_type,
-                messages: _,
-                in_reply_to: _,
-            } if message_type == "read_ok" => Ok(vec![]),
-            _ => Err(Error::NotSupported),
+            Payload::BroadcastOk { .. } | Payload::ReadOk { .. } | Payload::TopologyOk { .. } => {
+                Ok(vec![])
+            }
         }
     }
 }

@@ -35,14 +35,15 @@ impl<T: Actor + Default> Runtime<T> {
         }
     }
 
-    fn init(&mut self, buffer: &mut String) {
+    fn init(&mut self) {
+        let mut buffer = String::new();
         // read an init message
         std::io::stdin()
-            .read_line(buffer)
+            .read_line(&mut buffer)
             .expect("could not read stdin");
 
         // initialize node
-        let init_msg: Message<InitMsg> = Message::deserialize(buffer);
+        let init_msg: Message<InitMsg> = Message::deserialize(&buffer);
         self.node
             .init(
                 init_msg.body.node_id.to_owned(),
@@ -56,12 +57,11 @@ impl<T: Actor + Default> Runtime<T> {
             in_reply_to: init_msg.body.msg_id,
         };
         println!("{}", Message::new_reply_to(&init_msg, ack).serialize());
-        buffer.clear();
     }
 
     pub fn start(&mut self) -> ! {
         let mut buffer = String::new();
-        self.init(&mut buffer);
+        self.init();
         loop {
             std::io::stdin()
                 .read_line(&mut buffer)
