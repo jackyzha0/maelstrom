@@ -3,12 +3,18 @@ use crate::{
     message::{Message, MessageID},
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+};
 
-pub struct Runtime<T: Actor + Default> {
+pub struct Runtime<T: Actor + Default + Send> {
     node: T,
+    rx: Receiver<Message<T::MessagePayload>>,
+    pub tx: Sender<Message<T::MessagePayload>>,
 }
 
-impl<T: Actor + Default> Default for Runtime<T> {
+impl<T: Actor + Default + Send + 'static> Default for Runtime<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -28,10 +34,13 @@ struct InitAckMsg {
     in_reply_to: MessageID,
 }
 
-impl<T: Actor + Default> Runtime<T> {
+impl<T: Actor + Default + Send + 'static> Runtime<T> {
     pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<Message<T::MessagePayload>>();
         Self {
             node: Default::default(),
+            rx,
+            tx,
         }
     }
 
@@ -46,6 +55,7 @@ impl<T: Actor + Default> Runtime<T> {
         let init_msg: Message<InitMsg> = Message::deserialize(&buffer);
         self.node
             .init(
+                self.tx.clone(),
                 init_msg.body.node_id.to_owned(),
                 init_msg.body.node_ids.to_owned(),
             )
@@ -59,14 +69,19 @@ impl<T: Actor + Default> Runtime<T> {
         println!("{}", Message::new_reply_to(&init_msg, ack).serialize());
     }
 
-    pub fn start(&mut self) -> ! {
-        let mut buffer = String::new();
+    pub fn start(&mut self) {
         self.init();
-        loop {
-            std::io::stdin()
-                .read_line(&mut buffer)
-                .expect("could not read stdin");
-            let msg: Message<T::MessagePayload> = Message::deserialize(&buffer);
+
+        let tx = self.tx.clone();
+        let jh = thread::spawn(move || loop {
+            for raw_line in std::io::stdin().lines() {
+                let line = raw_line.unwrap();
+                let msg: Message<T::MessagePayload> = Message::deserialize(&line);
+                tx.send(msg).expect("sending message through tx");
+            }
+        });
+
+        for msg in self.rx.iter() {
             match self.node.receive(&msg) {
                 Ok(responses) => {
                     for resp in responses {
@@ -78,7 +93,11 @@ impl<T: Actor + Default> Runtime<T> {
                     continue;
                 }
             }
-            buffer.clear();
+        }
+
+        match jh.join() {
+            Ok(_) => {},
+            Err(e) => eprintln!("panicked on joining thread: {:?}", e),
         }
     }
 }

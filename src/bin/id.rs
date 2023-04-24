@@ -1,3 +1,5 @@
+use std::sync::mpsc::Sender;
+
 use maelstrom::{
     actor::Actor,
     errors::Error,
@@ -36,7 +38,12 @@ enum Payload {
 impl Actor for IDActor {
     type MessagePayload = Payload;
 
-    fn init(&mut self, node_id: String, _peers: Vec<String>) -> Result<(), Error> {
+    fn init(
+        &mut self,
+        _tx: Sender<Message<Self::MessagePayload>>,
+        node_id: String,
+        _peers: Vec<String>,
+    ) -> Result<(), Error> {
         eprintln!("Initialized node {}", node_id);
         self.node_id = Some(node_id);
         Ok(())

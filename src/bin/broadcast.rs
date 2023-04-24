@@ -6,7 +6,12 @@ use maelstrom::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::mpsc::Sender,
+    thread,
+    time::Duration,
+};
 
 fn main() {
     let mut runtime = Runtime::<BroadcastActor>::new();
@@ -41,6 +46,7 @@ enum Payload {
     BroadcastOk {
         in_reply_to: MessageID,
     },
+    StartGossip,
     Gossip {
         payload: Vec<(UniqueMessageID, Value)>,
     },
@@ -66,9 +72,30 @@ impl BroadcastActor {
 impl Actor for BroadcastActor {
     type MessagePayload = Payload;
 
-    fn init(&mut self, node_id: ActorID, _node_ids: Vec<ActorID>) -> Result<(), Error> {
+    fn init(
+        &mut self,
+        tx: Sender<Message<Self::MessagePayload>>,
+        node_id: ActorID,
+        _node_ids: Vec<ActorID>,
+    ) -> Result<(), Error> {
         eprintln!("Initialized node {}", node_id);
-        self.node_id = Some(node_id);
+        self.node_id = Some(node_id.clone());
+
+        thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(100));
+            match tx.send(Message {
+                src: node_id.clone(),
+                dest: node_id.clone(),
+                body: Payload::StartGossip,
+            }) {
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("error while sending gossip signal: {}", e);
+                    break;
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -90,73 +117,76 @@ impl Actor for BroadcastActor {
                 message: payload,
             } => {
                 let unique_id: UniqueMessageID = (message.src.to_string(), *msg_id);
-                let mut messages = self.receive(&Message {
-                    src: self.node_id(),
-                    dest: self.node_id(),
-                    body: Payload::Gossip {
-                        payload: vec![(unique_id, payload.to_owned())],
-                    },
-                })?;
-                messages.push(Message::new_reply_to(
+
+                // add to our messages and set it as known
+                let our_known = self.known.entry(self.node_id()).or_default();
+                self.messages
+                    .push((unique_id.to_owned(), payload.to_owned()));
+                our_known.insert(unique_id);
+
+                Ok(vec![Message::new_reply_to(
                     message,
                     Payload::BroadcastOk {
                         in_reply_to: *msg_id,
                     },
-                ));
-                Ok(messages)
+                )])
+            }
+            Payload::StartGossip => {
+                let node_id = self.node_id();
+                let responses = self
+                    .peers
+                    .iter()
+                    .filter_map(|peer| {
+                        let known = self.known.entry(peer.to_owned()).or_default();
+                        let msgs_to_send: Vec<(UniqueMessageID, Value)> = self
+                            .messages
+                            .iter()
+                            .cloned()
+                            .filter(|(msg_id, _)| !known.contains(msg_id))
+                            .collect();
+                        if msgs_to_send.is_empty() {
+                            None
+                        } else {
+                            Some(Message {
+                                src: node_id.clone(),
+                                dest: peer.to_owned(),
+                                body: Payload::Gossip {
+                                    payload: msgs_to_send,
+                                },
+                            })
+                        }
+                    })
+                    .collect();
+                Ok(responses)
             }
             Payload::Gossip { payload } => {
                 let our_id = self.node_id();
-                let our_known = self.known.entry(our_id.to_owned()).or_default();
+                let our_known = self.known.entry(our_id).or_default();
                 for (msg_id, value) in payload {
                     if !our_known.contains(msg_id) {
                         self.messages.push((msg_id.to_owned(), value.to_owned()));
                         our_known.insert(msg_id.to_owned());
                     }
                 }
-
-                // ack
-                let mut responses: Vec<Message<Self::MessagePayload>> =
-                    vec![Message::new_reply_to(
-                        message,
-                        Payload::GossipOk { seen: our_known.to_owned() },
-                    )];
-
-                // construct gossip messages
-                responses.extend(self.peers.iter().filter_map(|peer| {
-                    let known = self.known.entry(peer.to_owned()).or_default();
-                    let msgs_to_send: Vec<(UniqueMessageID, Value)> = self
-                        .messages
-                        .iter()
-                        .cloned()
-                        .filter(|(msg_id, _)| !known.contains(msg_id))
-                        .collect();
-                    if msgs_to_send.is_empty() {
-                        None
-                    } else {
-                        Some(Message {
-                            src: our_id.clone(),
-                            dest: peer.to_owned(),
-                            body: Payload::Gossip {
-                                payload: msgs_to_send,
-                            },
-                        })
-                    }
-                }));
-                Ok(responses)
+                Ok(vec![Message::new_reply_to(
+                    message,
+                    Payload::GossipOk {
+                        seen: our_known.to_owned(),
+                    },
+                )])
             }
             Payload::GossipOk { seen } => {
                 let their_known = self.known.entry(message.src.to_owned()).or_default();
                 their_known.extend(seen.iter().cloned());
                 Ok(vec![])
             }
-            Payload::Read { msg_id } => {
-                let ack = Payload::ReadOk {
+            Payload::Read { msg_id } => Ok(vec![Message::new_reply_to(
+                message,
+                Payload::ReadOk {
                     messages: self.messages.iter().map(|m| m.1.to_owned()).collect(),
                     in_reply_to: *msg_id,
-                };
-                Ok(vec![Message::new_reply_to(message, ack)])
-            }
+                },
+            )]),
             Payload::BroadcastOk { .. } | Payload::ReadOk { .. } | Payload::TopologyOk { .. } => {
                 Ok(vec![])
             }
